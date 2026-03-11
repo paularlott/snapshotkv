@@ -153,26 +153,30 @@ func TestSetExWithTTL(t *testing.T) {
 	}
 
 	dir := tempDir(t)
-	db := openDB(t, dir, &Config{
-		TTLCleanupInterval: 10 * time.Millisecond,
+	db, err := Open(dir, &Config{
+		TTLCleanupInterval: 1 * time.Hour, // Long interval to avoid automatic cleanup
 	})
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
 
 	key := "test:ttl"
 	value := map[string]any{"name": "test"}
 
-	// Set with TTL (100ms is sufficient with nanosecond precision)
-	if err := db.SetEx(key, value, 100*time.Millisecond); err != nil {
+	// Set with TTL
+	if err := db.SetEx(key, value, 50*time.Millisecond); err != nil {
 		t.Fatalf("Failed to set value with TTL: %v", err)
 	}
 
 	// Should exist immediately
-	_, err := db.Get(key)
+	_, err = db.Get(key)
 	if err != nil {
 		t.Fatalf("Key should exist immediately: %v", err)
 	}
 
-	// Wait for TTL to expire (with margin)
-	time.Sleep(150 * time.Millisecond)
+	// Wait for TTL to expire
+	time.Sleep(100 * time.Millisecond)
 
 	// Manually trigger cleanup for test reliability
 	db.cleanupExpired()
