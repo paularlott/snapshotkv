@@ -935,15 +935,19 @@ func TestBlobWithTTL(t *testing.T) {
 	}
 
 	dir := tempDir(t)
-	db := openDB(t, dir, &Config{
-		TTLCleanupInterval: 10 * time.Millisecond,
+	db, err := Open(dir, &Config{
+		TTLCleanupInterval: 1 * time.Hour, // Long interval to avoid automatic cleanup
 	})
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
 
 	key := "blob:ttl"
 	blobData := []byte("temporary blob")
 
-	// Set with blob and TTL (100ms is sufficient with nanosecond precision)
-	if err := db.SetWithBlobEx(key, map[string]any{}, blobData, 100*time.Millisecond); err != nil {
+	// Set with blob and TTL
+	if err := db.SetWithBlobEx(key, map[string]any{}, blobData, 50*time.Millisecond); err != nil {
 		t.Fatalf("Failed to set with blob and TTL: %v", err)
 	}
 
@@ -952,8 +956,10 @@ func TestBlobWithTTL(t *testing.T) {
 		t.Fatalf("Blob should exist: %v", err)
 	}
 
-	// Wait for expiry and cleanup (with margin)
-	time.Sleep(150 * time.Millisecond)
+	// Wait for expiry
+	time.Sleep(100 * time.Millisecond)
+	
+	// Manually trigger cleanup
 	db.cleanupExpired()
 
 	// Should be gone
