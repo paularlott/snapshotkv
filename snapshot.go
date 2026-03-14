@@ -13,13 +13,20 @@ import (
 )
 
 // SnapshotVersion is the current snapshot format version
-const SnapshotVersion = 1
+const SnapshotVersion = 2
 
-// Snapshot represents the on-disk snapshot format
-type Snapshot struct {
+// v1Snapshot represents the old on-disk snapshot format (for migration)
+type v1Snapshot struct {
 	Version   int                       `msgpack:"version" json:"version"`
 	CreatedAt time.Time                 `msgpack:"created_at" json:"created_at"`
 	Data      map[string]map[string]any `msgpack:"data" json:"data"`
+}
+
+// Snapshot represents the on-disk snapshot format
+type Snapshot struct {
+	Version   int              `msgpack:"version" json:"version"`
+	CreatedAt time.Time        `msgpack:"created_at" json:"created_at"`
+	Data      map[string]*entry `msgpack:"data" json:"data"`
 }
 
 // snapshotManager handles reading/writing snapshot files
@@ -108,8 +115,8 @@ func parseSnapshotTime(filename string) (time.Time, uint16, bool) {
 	return t, counter, true
 }
 
-// Save writes a snapshot to disk
-func (s *snapshotManager) save(data map[string]map[string]any) error {
+// save writes a snapshot to disk
+func (s *snapshotManager) save(data map[string]*entry) error {
 	snapshot := &Snapshot{
 		Version:   SnapshotVersion,
 		CreatedAt: time.Now(),
@@ -172,13 +179,13 @@ func (s *snapshotManager) save(data map[string]map[string]any) error {
 	return nil
 }
 
-// Load loads the most recent valid snapshot from disk
-func (s *snapshotManager) load() (map[string]map[string]any, error) {
+// load loads the most recent valid snapshot from disk
+func (s *snapshotManager) load() (map[string]*entry, error) {
 	// List snapshot files
 	entries, err := os.ReadDir(s.basePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return make(map[string]map[string]any), nil
+			return make(map[string]*entry), nil
 		}
 		return nil, fmt.Errorf("failed to read snapshots directory: %w", err)
 	}
@@ -190,13 +197,13 @@ func (s *snapshotManager) load() (map[string]map[string]any, error) {
 			continue
 		}
 		name := entry.Name()
-		if strings.HasPrefix(name, "data-") && !strings.HasPrefix(name, ".tmp") {
+		if strings.HasPrefix(name, "data-") && !strings.HasSuffix(name, ".tmp") {
 			snapshots = append(snapshots, name)
 		}
 	}
 
 	if len(snapshots) == 0 {
-		return make(map[string]map[string]any), nil
+		return make(map[string]*entry), nil
 	}
 
 	// Sort by timestamp and counter (descending)
@@ -225,7 +232,7 @@ func (s *snapshotManager) load() (map[string]map[string]any, error) {
 }
 
 // loadFile loads a specific snapshot file
-func (s *snapshotManager) loadFile(filename string) (map[string]map[string]any, error) {
+func (s *snapshotManager) loadFile(filename string) (map[string]*entry, error) {
 	filePath := filepath.Join(s.basePath, filename)
 
 	f, err := os.Open(filePath)
@@ -250,24 +257,77 @@ func (s *snapshotManager) loadFile(filename string) (map[string]map[string]any, 
 		return nil, fmt.Errorf("failed to read snapshot: %w", err)
 	}
 
+	// Try to detect version by peeking at the data
+	var version struct {
+		Version int `msgpack:"version" json:"version"`
+	}
+	if err := s.codec.Decode(encoded, &version); err != nil {
+		return nil, fmt.Errorf("failed to decode snapshot version: %w", err)
+	}
+
+	// Handle different versions
+	switch version.Version {
+	case 1:
+		return s.loadV1(encoded)
+	case 2:
+		return s.loadV2(encoded)
+	default:
+		return nil, fmt.Errorf("unsupported snapshot version: %d", version.Version)
+	}
+}
+
+// loadV2 loads a v2 snapshot (current format)
+func (s *snapshotManager) loadV2(encoded []byte) (map[string]*entry, error) {
 	var snapshot Snapshot
 	if err := s.codec.Decode(encoded, &snapshot); err != nil {
-		return nil, fmt.Errorf("failed to decode snapshot: %w", err)
+		return nil, fmt.Errorf("failed to decode v2 snapshot: %w", err)
 	}
-
-	// Validate version
-	if snapshot.Version > SnapshotVersion {
-		return nil, fmt.Errorf("unsupported snapshot version: %d", snapshot.Version)
-	}
-
 	return snapshot.Data, nil
+}
+
+// loadV1 loads and migrates a v1 snapshot (old format with map[string]map[string]any)
+// TODO: Remove v1 migration support in a future release once all snapshots have been converted to v2
+func (s *snapshotManager) loadV1(encoded []byte) (map[string]*entry, error) {
+	var snapshot v1Snapshot
+	if err := s.codec.Decode(encoded, &snapshot); err != nil {
+		return nil, fmt.Errorf("failed to decode v1 snapshot: %w", err)
+	}
+
+	// Migrate v1 format to v2
+	data := make(map[string]*entry)
+	for key, doc := range snapshot.Data {
+		e := &entry{}
+
+		// Extract TTL
+		if expiresAtRaw, ok := doc["_ttl_expires"]; ok {
+			switch v := expiresAtRaw.(type) {
+			case int64:
+				e.ExpiresAt = v
+			case int:
+				e.ExpiresAt = int64(v)
+			case float64:
+				e.ExpiresAt = int64(v)
+			}
+			delete(doc, "_ttl_expires")
+		}
+
+		// Extract blob reference
+		if blobRef, ok := doc["_blob_ref"].(string); ok {
+			e.BlobRef = blobRef
+			delete(doc, "_blob_ref")
+		}
+
+		// Everything else is the value
+		e.Value = doc
+
+		data[key] = e
+	}
+
+	return data, nil
 }
 
 // cleanupOldSnapshots removes old snapshot files beyond retention limit
 func (s *snapshotManager) cleanupOldSnapshots() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	entries, err := os.ReadDir(s.basePath)
 	if err != nil {
 		return
@@ -280,7 +340,7 @@ func (s *snapshotManager) cleanupOldSnapshots() {
 			continue
 		}
 		name := entry.Name()
-		if strings.HasPrefix(name, "data-") && !strings.HasPrefix(name, ".tmp") {
+		if strings.HasPrefix(name, "data-") && !strings.HasSuffix(name, ".tmp") {
 			snapshots = append(snapshots, name)
 		}
 	}

@@ -94,11 +94,16 @@ func TestSetGet(t *testing.T) {
 		t.Fatalf("Failed to get value: %v", err)
 	}
 
-	if got["name"] != "test" {
-		t.Errorf("Expected name=test, got %v", got["name"])
+	m, ok := got.(map[string]any)
+	if !ok {
+		t.Fatalf("Expected map[string]any, got %T", got)
 	}
-	if got["value"] != 123 {
-		t.Errorf("Expected value=123, got %v", got["value"])
+
+	if m["name"] != "test" {
+		t.Errorf("Expected name=test, got %v", m["name"])
+	}
+	if m["value"] != 123 {
+		t.Errorf("Expected value=123, got %v", m["value"])
 	}
 }
 
@@ -252,7 +257,11 @@ func TestBlobOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to get metadata: %v", err)
 	}
-	if _, exists := got["_blob_ref"]; exists {
+	m, ok := got.(map[string]any)
+	if !ok {
+		t.Fatalf("Expected map[string]any, got %T", got)
+	}
+	if _, exists := m["_blob_ref"]; exists {
 		t.Error("_blob_ref should not be exposed to caller")
 	}
 
@@ -612,8 +621,12 @@ func TestCloseFlushesPendingWrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to get persisted value: %v", err)
 	}
-	if value["value"] != "pending" {
-		t.Errorf("Expected value='pending', got %v", value["value"])
+	m, ok := value.(map[string]any)
+	if !ok {
+		t.Fatalf("Expected map[string]any, got %T", value)
+	}
+	if m["value"] != "pending" {
+		t.Errorf("Expected value='pending', got %v", m["value"])
 	}
 }
 
@@ -655,9 +668,13 @@ func TestCloseFlushesMultipleWrites(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to get persisted value %s: %v", key, err)
 		}
+		m, ok := value.(map[string]any)
+		if !ok {
+			t.Fatalf("Expected map[string]any for key %s, got %T", key, value)
+		}
 		// Handle different numeric types from deserialization
 		var idx int
-		switch v := value["index"].(type) {
+		switch v := m["index"].(type) {
 		case int:
 			idx = v
 		case int8:
@@ -679,7 +696,7 @@ func TestCloseFlushesMultipleWrites(t *testing.T) {
 		case uint64:
 			idx = int(v)
 		default:
-			t.Errorf("Unexpected type for index: %T", value["index"])
+			t.Errorf("Unexpected type for index: %T", m["index"])
 			continue
 		}
 		if idx != i {
@@ -774,18 +791,23 @@ func TestPersistence(t *testing.T) {
 		t.Fatalf("Failed to get persisted value: %v", err)
 	}
 
-	if got["name"] != "persistent" {
-		t.Errorf("Expected name=persistent, got %v", got["name"])
+	m, ok := got.(map[string]any)
+	if !ok {
+		t.Fatalf("Expected map[string]any, got %T", got)
+	}
+
+	if m["name"] != "persistent" {
+		t.Errorf("Expected name=persistent, got %v", m["name"])
 	}
 
 	// Handle different numeric types from deserialization
-	count, ok := got["count"].(int64)
+	count, ok := m["count"].(int64)
 	if !ok {
 		// msgpack may decode as different integer types
-		if f, ok := got["count"].(int); ok {
+		if f, ok := m["count"].(int); ok {
 			count = int64(f)
 		} else {
-			t.Errorf("count has unexpected type: %T", got["count"])
+			t.Errorf("count has unexpected type: %T", m["count"])
 		}
 	}
 	if count != 42 {
@@ -813,8 +835,13 @@ func TestJSONCodec(t *testing.T) {
 		t.Fatalf("Failed to get value: %v", err)
 	}
 
-	if got["name"] != "test" {
-		t.Errorf("Expected name=test, got %v", got["name"])
+	m, ok := got.(map[string]any)
+	if !ok {
+		t.Fatalf("Expected map[string]any, got %T", got)
+	}
+
+	if m["name"] != "test" {
+		t.Errorf("Expected name=test, got %v", m["name"])
 	}
 }
 
@@ -989,22 +1016,28 @@ func TestEmptyValue(t *testing.T) {
 		t.Fatalf("Failed to get empty value: %v", err)
 	}
 
-	if len(got) != 0 {
-		t.Errorf("Expected empty map, got %v", got)
+	m, ok := got.(map[string]any)
+	if !ok {
+		t.Fatalf("Expected map[string]any, got %T", got)
+	}
+
+	if len(m) != 0 {
+		t.Errorf("Expected empty map, got %v", m)
 	}
 }
 
-// TestInternalFieldsNotExposed verifies internal fields are stripped
-func TestInternalFieldsNotExposed(t *testing.T) {
+// TestValuesStoredAsIs verifies that values are stored exactly as provided
+// (internal metadata like blob refs and TTL are stored separately in the entry struct)
+func TestValuesStoredAsIs(t *testing.T) {
 	dir := tempDir(t)
 	db := openDB(t, dir, nil)
 
-	// Try to set internal fields (they should be preserved internally but not returned)
+	// Values with underscore-prefixed fields should be stored as-is
 	key := "internal:test"
 	value := map[string]any{
-		"name":          "test",
-		"_blob_ref":     "should-be-overwritten",
-		"_ttl_expires":  12345,
+		"name":      "test",
+		"_internal": "preserved",
+		"_meta":     12345,
 	}
 
 	if err := db.Set(key, value); err != nil {
@@ -1016,17 +1049,20 @@ func TestInternalFieldsNotExposed(t *testing.T) {
 		t.Fatalf("Failed to get value: %v", err)
 	}
 
-	// Internal fields should not be in returned data
-	if _, exists := got["_blob_ref"]; exists {
-		t.Error("_blob_ref should not be exposed")
-	}
-	if _, exists := got["_ttl_expires"]; exists {
-		t.Error("_ttl_expires should not be exposed")
+	m, ok := got.(map[string]any)
+	if !ok {
+		t.Fatalf("Expected map[string]any, got %T", got)
 	}
 
-	// Regular field should be there
-	if got["name"] != "test" {
-		t.Errorf("Expected name=test, got %v", got["name"])
+	// All fields should be preserved exactly as provided
+	if m["name"] != "test" {
+		t.Errorf("Expected name=test, got %v", m["name"])
+	}
+	if m["_internal"] != "preserved" {
+		t.Errorf("Expected _internal=preserved, got %v", m["_internal"])
+	}
+	if m["_meta"] != 12345 {
+		t.Errorf("Expected _meta=12345, got %v", m["_meta"])
 	}
 }
 

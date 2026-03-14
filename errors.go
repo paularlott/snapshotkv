@@ -1,6 +1,8 @@
 package snapshotkv
 
-import "errors"
+import (
+	"errors"
+)
 
 var (
 	// ErrNotFound is returned when a key does not exist
@@ -26,12 +28,6 @@ var (
 
 	// ErrMemoryOnly is returned when trying to use blob operations in memory-only mode
 	ErrMemoryOnly = errors.New("blob operations not supported in memory-only mode")
-)
-
-// Internal field names - these are stripped from data returned to callers
-const (
-	internalBlobRef   = "_blob_ref"
-	internalTTLExpres = "_ttl_expires"
 )
 
 // Backward compatibility aliases

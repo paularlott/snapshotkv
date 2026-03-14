@@ -29,8 +29,12 @@ func TestMemoryOnlyMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get should work in memory-only mode: %v", err)
 	}
-	if got["name"] != "test" {
-		t.Errorf("Expected name=test, got %v", got["name"])
+	m, ok := got.(map[string]any)
+	if !ok {
+		t.Fatalf("Expected map[string]any, got %T", got)
+	}
+	if m["name"] != "test" {
+		t.Errorf("Expected name=test, got %v", m["name"])
 	}
 
 	// Save should be no-op

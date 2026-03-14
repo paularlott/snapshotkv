@@ -26,10 +26,25 @@ type Config struct {
 	Codec Codec
 }
 
+// entry holds a stored value with its metadata
+type entry struct {
+	Value     any    `msgpack:"value" json:"value"`
+	ExpiresAt int64  `msgpack:"expires_at" json:"expires_at"` // UnixNano, 0 = no expiration
+	BlobRef   string `msgpack:"blob_ref" json:"blob_ref"`     // empty = no blob
+}
+
+// isExpired returns true if the entry has expired
+func (e *entry) isExpired() bool {
+	if e.ExpiresAt == 0 {
+		return false
+	}
+	return time.Now().UnixNano() > e.ExpiresAt
+}
+
 // DB is the main database structure
 type DB struct {
 	mu        sync.RWMutex
-	data      map[string]map[string]any
+	data      map[string]*entry
 	config    *Config
 	snapshots *snapshotManager
 	blobs     *blobManager
@@ -73,7 +88,7 @@ func Open(path string, cfg *Config) (*DB, error) {
 	memoryOnly := cfg.Path == ""
 
 	db := &DB{
-		data:       make(map[string]map[string]any),
+		data:       make(map[string]*entry),
 		config:     cfg,
 		memoryOnly: memoryOnly,
 		ttlStopCh:  make(chan struct{}),
@@ -244,8 +259,9 @@ func (db *DB) stopTimerAndFlush() {
 	}
 }
 
-// Get retrieves a value by key
-func (db *DB) Get(key string) (map[string]any, error) {
+// Get retrieves a value by key.
+// Returns ErrNotFound if the key doesn't exist or has expired.
+func (db *DB) Get(key string) (any, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
@@ -253,34 +269,27 @@ func (db *DB) Get(key string) (map[string]any, error) {
 		return nil, err
 	}
 
-	data, exists := db.data[key]
+	entry, exists := db.data[key]
 	if !exists {
 		return nil, ErrNotFound
 	}
 
-	// Return a copy without internal fields
-	return db.stripInternalFields(data), nil
-}
-
-// stripInternalFields removes internal fields from a document
-func (db *DB) stripInternalFields(data map[string]any) map[string]any {
-	// Pre-size to avoid reallocation (minus 2 for potential internal fields)
-	result := make(map[string]any, len(data)-2)
-	for k, v := range data {
-		if k != internalBlobRef && k != internalTTLExpres {
-			result[k] = v
-		}
+	// Check expiration
+	if entry.isExpired() {
+		return nil, ErrNotFound
 	}
-	return result
+
+	return entry.Value, nil
 }
 
-// Set stores a value without expiry
-func (db *DB) Set(key string, value map[string]any) error {
+// Set stores a value without expiry.
+func (db *DB) Set(key string, value any) error {
 	return db.SetEx(key, value, 0)
 }
 
-// SetEx stores a value with TTL
-func (db *DB) SetEx(key string, value map[string]any, ttl time.Duration) error {
+// SetEx stores a value with TTL.
+// Use ttl=0 for no expiration.
+func (db *DB) SetEx(key string, value any, ttl time.Duration) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -292,16 +301,15 @@ func (db *DB) SetEx(key string, value map[string]any, ttl time.Duration) error {
 }
 
 // setLocked stores a value (must be called with lock held)
-func (db *DB) setLocked(key string, value map[string]any, ttl time.Duration) error {
-	// Copy value to avoid external mutations
-	data := db.copyMap(value)
+func (db *DB) setLocked(key string, value any, ttl time.Duration) error {
+	e := &entry{Value: value}
 
-	// Set TTL if provided (store as nanoseconds for precision)
+	// Set TTL if provided
 	if ttl > 0 {
-		data[internalTTLExpres] = time.Now().Add(ttl).UnixNano()
+		e.ExpiresAt = time.Now().Add(ttl).UnixNano()
 	}
 
-	db.data[key] = data
+	db.data[key] = e
 
 	// Mark dirty for debounced save
 	db.markDirty()
@@ -309,19 +317,7 @@ func (db *DB) setLocked(key string, value map[string]any, ttl time.Duration) err
 	return nil
 }
 
-// copyMap creates a deep copy of a map
-func (db *DB) copyMap(src map[string]any) map[string]any {
-	if src == nil {
-		return nil
-	}
-	dst := make(map[string]any, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
-}
-
-// Delete removes a key and its associated blob
+// Delete removes a key and its associated blob.
 func (db *DB) Delete(key string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -335,16 +331,14 @@ func (db *DB) Delete(key string) error {
 
 // deleteLocked removes a key (must be called with lock held)
 func (db *DB) deleteLocked(key string) error {
-	data, exists := db.data[key]
+	entry, exists := db.data[key]
 	if !exists {
 		return nil // Already gone
 	}
 
 	// Delete associated blob if exists (and not in memory-only mode)
-	if !db.memoryOnly {
-		if blobRef, ok := data[internalBlobRef].(string); ok && blobRef != "" {
-			db.blobs.deleteBlob(blobRef)
-		}
+	if !db.memoryOnly && entry.BlobRef != "" {
+		db.blobs.deleteBlob(entry.BlobRef)
 	}
 
 	delete(db.data, key)
@@ -355,7 +349,55 @@ func (db *DB) deleteLocked(key string) error {
 	return nil
 }
 
-// FindKeysByPrefix returns all keys matching a prefix
+// Exists checks if a key exists and is not expired.
+func (db *DB) Exists(key string) bool {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	if db.closed {
+		return false
+	}
+
+	entry, exists := db.data[key]
+	if !exists {
+		return false
+	}
+
+	return !entry.isExpired()
+}
+
+// TTL returns the remaining time-to-live for a key.
+// Returns -1 if the key has no expiration, -2 if the key doesn't exist.
+func (db *DB) TTL(key string) time.Duration {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	if db.closed {
+		return -2 * time.Second
+	}
+
+	entry, exists := db.data[key]
+	if !exists {
+		return -2 * time.Second // Key doesn't exist
+	}
+
+	if entry.isExpired() {
+		return -2 * time.Second // Key has expired
+	}
+
+	if entry.ExpiresAt == 0 {
+		return -1 * time.Second // No expiration
+	}
+
+	now := time.Now().UnixNano()
+	if now >= entry.ExpiresAt {
+		return -2 * time.Second // Already expired
+	}
+
+	return time.Duration(entry.ExpiresAt - now)
+}
+
+// FindKeysByPrefix returns all non-expired keys matching a prefix.
 func (db *DB) FindKeysByPrefix(prefix string) []string {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -365,8 +407,11 @@ func (db *DB) FindKeysByPrefix(prefix string) []string {
 	}
 
 	var keys []string
-	for key := range db.data {
-		if len(prefix) == 0 || len(key) >= len(prefix) && key[:len(prefix)] == prefix {
+	for key, entry := range db.data {
+		if entry.isExpired() {
+			continue
+		}
+		if len(prefix) == 0 || (len(key) >= len(prefix) && key[:len(prefix)] == prefix) {
 			keys = append(keys, key)
 		}
 	}
@@ -376,15 +421,15 @@ func (db *DB) FindKeysByPrefix(prefix string) []string {
 	return keys
 }
 
-// SetWithBlob stores a value with blob data (no expiry)
-// Returns ErrMemoryOnly in memory-only mode
-func (db *DB) SetWithBlob(key string, value map[string]any, blob []byte) error {
+// SetWithBlob stores a value with blob data (no expiry).
+// Returns ErrMemoryOnly in memory-only mode.
+func (db *DB) SetWithBlob(key string, value any, blob []byte) error {
 	return db.SetWithBlobEx(key, value, blob, 0)
 }
 
-// SetWithBlobEx stores a value with blob data and TTL
-// Returns ErrMemoryOnly in memory-only mode
-func (db *DB) SetWithBlobEx(key string, value map[string]any, blob []byte, ttl time.Duration) error {
+// SetWithBlobEx stores a value with blob data and TTL.
+// Returns ErrMemoryOnly in memory-only mode.
+func (db *DB) SetWithBlobEx(key string, value any, blob []byte, ttl time.Duration) error {
 	if db.memoryOnly {
 		return ErrMemoryOnly
 	}
@@ -407,15 +452,16 @@ func (db *DB) SetWithBlobEx(key string, value map[string]any, blob []byte, ttl t
 		db.transactionBlobs = append(db.transactionBlobs, blobRef)
 	}
 
-	// Copy value and add blob reference
-	data := db.copyMap(value)
-	data[internalBlobRef] = blobRef
-
+	// Create entry with blob reference
+	e := &entry{
+		Value:   value,
+		BlobRef: blobRef,
+	}
 	if ttl > 0 {
-		data[internalTTLExpres] = time.Now().Add(ttl).UnixNano()
+		e.ExpiresAt = time.Now().Add(ttl).UnixNano()
 	}
 
-	db.data[key] = data
+	db.data[key] = e
 
 	// Mark dirty for debounced save
 	db.markDirty()
@@ -423,8 +469,9 @@ func (db *DB) SetWithBlobEx(key string, value map[string]any, blob []byte, ttl t
 	return nil
 }
 
-// GetBlob retrieves the blob data for a key
-// Returns ErrMemoryOnly in memory-only mode
+// GetBlob retrieves the blob data for a key.
+// Returns ErrMemoryOnly in memory-only mode.
+// Returns ErrNoBlob if the key has no associated blob.
 func (db *DB) GetBlob(key string) ([]byte, error) {
 	if db.memoryOnly {
 		return nil, ErrMemoryOnly
@@ -437,21 +484,24 @@ func (db *DB) GetBlob(key string) ([]byte, error) {
 		return nil, err
 	}
 
-	data, exists := db.data[key]
+	entry, exists := db.data[key]
 	if !exists {
 		return nil, ErrNotFound
 	}
 
-	blobRef, ok := data[internalBlobRef].(string)
-	if !ok || blobRef == "" {
+	if entry.isExpired() {
+		return nil, ErrNotFound
+	}
+
+	if entry.BlobRef == "" {
 		return nil, ErrNoBlob
 	}
 
-	return db.blobs.readBlob(blobRef)
+	return db.blobs.readBlob(entry.BlobRef)
 }
 
-// UpdateBlob updates the blob data for an existing key
-// Returns ErrMemoryOnly in memory-only mode
+// UpdateBlob updates the blob data for an existing key.
+// Returns ErrMemoryOnly in memory-only mode.
 func (db *DB) UpdateBlob(key string, blob []byte) error {
 	if db.memoryOnly {
 		return ErrMemoryOnly
@@ -464,14 +514,14 @@ func (db *DB) UpdateBlob(key string, blob []byte) error {
 		return err
 	}
 
-	data, exists := db.data[key]
+	entry, exists := db.data[key]
 	if !exists {
 		return ErrNotFound
 	}
 
 	// Delete old blob if exists
-	if oldBlobRef, ok := data[internalBlobRef].(string); ok && oldBlobRef != "" {
-		db.blobs.deleteBlob(oldBlobRef)
+	if entry.BlobRef != "" {
+		db.blobs.deleteBlob(entry.BlobRef)
 	}
 
 	// Write new blob
@@ -485,8 +535,8 @@ func (db *DB) UpdateBlob(key string, blob []byte) error {
 		db.transactionBlobs = append(db.transactionBlobs, blobRef)
 	}
 
-	// Update data with new blob reference
-	data[internalBlobRef] = blobRef
+	// Update entry with new blob reference
+	entry.BlobRef = blobRef
 
 	// Mark dirty for debounced save
 	db.markDirty()
@@ -494,7 +544,7 @@ func (db *DB) UpdateBlob(key string, blob []byte) error {
 	return nil
 }
 
-// BeginTransaction starts transaction mode (defers save until Commit)
+// BeginTransaction starts transaction mode (defers save until Commit).
 func (db *DB) BeginTransaction() error {
 	db.transactionMu.Lock()
 	defer db.transactionMu.Unlock()
@@ -515,7 +565,7 @@ func (db *DB) BeginTransaction() error {
 	return nil
 }
 
-// Commit exits transaction mode and saves immediately
+// Commit exits transaction mode and saves immediately.
 func (db *DB) Commit() error {
 	db.transactionMu.Lock()
 	defer db.transactionMu.Unlock()
@@ -541,7 +591,7 @@ func (db *DB) Commit() error {
 	return nil
 }
 
-// Rollback exits transaction mode without saving and deletes any blobs created
+// Rollback exits transaction mode without saving and deletes any blobs created.
 func (db *DB) Rollback() error {
 	db.transactionMu.Lock()
 	defer db.transactionMu.Unlock()
@@ -589,33 +639,13 @@ func (db *DB) cleanupExpired() {
 		return
 	}
 
-	now := time.Now().UnixNano()
 	var deleted bool
 
-	for key, data := range db.data {
-		// Handle different integer types from deserialization
-		var expiresAt int64
-		switch v := data[internalTTLExpres].(type) {
-		case int64:
-			expiresAt = v
-		case int:
-			expiresAt = int64(v)
-		case uint64:
-			expiresAt = int64(v)
-		case int32:
-			expiresAt = int64(v)
-		case uint32:
-			expiresAt = int64(v)
-		default:
-			continue // No TTL or unknown type
-		}
-
-		if expiresAt < now {
+	for key, entry := range db.data {
+		if entry.isExpired() {
 			// Delete blob if exists (and not in memory-only mode)
-			if !db.memoryOnly {
-				if blobRef, ok := data[internalBlobRef].(string); ok && blobRef != "" {
-					db.blobs.deleteBlob(blobRef)
-				}
+			if !db.memoryOnly && entry.BlobRef != "" {
+				db.blobs.deleteBlob(entry.BlobRef)
 			}
 			delete(db.data, key)
 			deleted = true
@@ -643,9 +673,9 @@ func (db *DB) cleanupOrphanedBlobs() {
 
 	// Build set of referenced blob IDs
 	referenced := make(map[string]struct{})
-	for _, data := range db.data {
-		if blobRef, ok := data[internalBlobRef].(string); ok && blobRef != "" {
-			referenced[blobRef] = struct{}{}
+	for _, entry := range db.data {
+		if entry.BlobRef != "" {
+			referenced[entry.BlobRef] = struct{}{}
 		}
 	}
 

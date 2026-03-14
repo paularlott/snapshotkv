@@ -83,14 +83,19 @@ func TestJSONCodecDecode(t *testing.T) {
 	}
 }
 
-// TestCopyMapNil tests copyMap with nil input
-func TestCopyMapNil(t *testing.T) {
+// TestGetOnClosedDB tests Get on closed database
+func TestGetOnClosedDB(t *testing.T) {
 	dir := tempDir(t)
-	db := openDB(t, dir, nil)
+	db, err := Open(dir, nil)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
 
-	result := db.copyMap(nil)
-	if result != nil {
-		t.Errorf("copyMap(nil) should return nil, got %v", result)
+	db.Close()
+
+	_, err = db.Get("any-key")
+	if err != ErrDatabaseClosed {
+		t.Errorf("Get on closed DB should return ErrDatabaseClosed, got %v", err)
 	}
 }
 
@@ -214,45 +219,33 @@ func TestFindKeysOnClosedDB(t *testing.T) {
 	}
 }
 
-// TestCleanupExpiredWithDifferentTypes tests TTL cleanup with various integer types
+// TestCleanupExpiredWithDifferentTypes tests TTL cleanup with various expiration times
 func TestCleanupExpiredWithDifferentTypes(t *testing.T) {
 	dir := tempDir(t)
 	db := openDB(t, dir, nil)
 
-	// Manually insert data with different TTL types
-	now := time.Now().UnixNano()
-	expired := now - int64(time.Hour)
+	// Manually insert data with expired TTL using the entry struct
+	expiredTime := time.Now().Add(-time.Hour).UnixNano() // 1 hour ago in UnixNano
 
 	db.mu.Lock()
-	db.data["test:int64"] = map[string]any{internalTTLExpres: expired}
-	db.data["test:int"] = map[string]any{internalTTLExpres: int(expired)}
-	db.data["test:uint64"] = map[string]any{internalTTLExpres: uint64(expired)}
-	db.data["test:int32"] = map[string]any{internalTTLExpres: int32(expired)}
-	db.data["test:uint32"] = map[string]any{internalTTLExpres: uint32(expired)}
-	db.data["test:string"] = map[string]any{internalTTLExpres: "not-a-number"} // Should be skipped
+	db.data["test:expired1"] = &entry{Value: "data1", ExpiresAt: expiredTime}
+	db.data["test:expired2"] = &entry{Value: "data2", ExpiresAt: expiredTime}
+	db.data["test:valid"] = &entry{Value: "data3"} // No expiration
 	db.mu.Unlock()
 
 	// Run cleanup
 	db.cleanupExpired()
 
-	// All numeric types should be cleaned up
-	for _, key := range []string{"test:int64", "test:int", "test:uint64", "test:int32", "test:uint32"} {
+	// Expired keys should be gone
+	for _, key := range []string{"test:expired1", "test:expired2"} {
 		if _, err := db.Get(key); err != ErrNotFound {
 			t.Errorf("Key %s should be expired, got error: %v", key, err)
 		}
 	}
 
-	// String type should remain (invalid TTL)
-	if _, err := db.Get("test:string"); err != ErrNotFound {
-		// Key should still exist since TTL was invalid
-		// Actually it should be gone since we manually set it with expired time
-		// Let's verify it exists
-		db.mu.RLock()
-		_, exists := db.data["test:string"]
-		db.mu.RUnlock()
-		if !exists {
-			t.Error("Key with invalid TTL type should not be cleaned up")
-		}
+	// Valid key should remain
+	if _, err := db.Get("test:valid"); err != nil {
+		t.Errorf("Key test:valid should still exist, got error: %v", err)
 	}
 }
 
@@ -340,8 +333,12 @@ func TestSnapshotLoadUncompressed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
 	}
-	if got["value"] != "test" {
-		t.Errorf("Expected value=test, got %v", got["value"])
+	m, ok := got.(map[string]any)
+	if !ok {
+		t.Fatalf("Expected map[string]any, got %T", got)
+	}
+	if m["value"] != "test" {
+		t.Errorf("Expected value=test, got %v", m["value"])
 	}
 }
 
@@ -355,9 +352,10 @@ func TestDeleteBlobError(t *testing.T) {
 		t.Fatalf("SetWithBlob failed: %v", err)
 	}
 
-	// Get blob ref
+	// Get blob ref from the entry struct
 	db.mu.RLock()
-	blobRef := db.data["test:key"][internalBlobRef].(string)
+	e := db.data["test:key"]
+	blobRef := e.BlobRef
 	db.mu.RUnlock()
 
 	// Delete the blob file directly
@@ -437,7 +435,7 @@ func TestSnapshotVersionCheck(t *testing.T) {
 	futureSnapshot := &Snapshot{
 		Version:   999,
 		CreatedAt: time.Now(),
-		Data:      map[string]map[string]any{},
+		Data:      map[string]*entry{},
 	}
 
 	encoded, _ := MsgpackCodec{}.Encode(futureSnapshot)

@@ -6,6 +6,7 @@ A lightweight, snapshot-based key-value storage engine with optional large blob 
 
 - **In-memory operations** with snapshot persistence
 - **Memory-only mode** - use without any file system (empty path)
+- **Flexible value types** - store any Go type (strings, ints, maps, slices, etc.)
 - **Debounced saves** with configurable interval (default: 10s)
 - **TTL support** with automatic cleanup
 - **Blob storage** for large binary data (loaded on demand)
@@ -43,23 +44,44 @@ func main() {
     }
     defer db.Close()
 
-    // Simple key-value (no expiry)
+    // Store a map
     db.Set("user:123", map[string]any{
         "name":  "Alice",
         "email": "alice@example.com",
     })
+
+    // Store a simple string
+    db.Set("config:api_key", "secret123")
+
+    // Store an integer
+    db.Set("counter", 42)
 
     // With TTL (30 days)
     db.SetEx("session:abc", map[string]any{
         "user_id": "123",
     }, 30*24*time.Hour)
 
-    // Get by key
+    // Get by key (returns any, type assert as needed)
     user, err := db.Get("user:123")
     if err != nil {
         panic(err)
     }
-    fmt.Println("User:", user["name"])
+    if m, ok := user.(map[string]any); ok {
+        fmt.Println("User:", m["name"])
+    }
+
+    // Get simple value
+    apiKey, _ := db.Get("config:api_key")
+    fmt.Println("API Key:", apiKey.(string))
+
+    // Check if key exists
+    if db.Exists("user:123") {
+        fmt.Println("User exists")
+    }
+
+    // Get remaining TTL
+    ttl := db.TTL("session:abc")
+    fmt.Println("Session expires in:", ttl)
 
     // Find keys by prefix
     keys := db.FindKeysByPrefix("user:")
@@ -83,7 +105,7 @@ if err != nil {
 defer db.Close()
 
 // All operations work except blob storage
-db.Set("cache:key", map[string]any{"value": "data"})
+db.Set("cache:key", "data")
 val, _ := db.Get("cache:key")
 
 // Blob operations return ErrMemoryOnly in this mode
@@ -208,17 +230,23 @@ db.IsMemoryOnly() bool  // Check if running in memory-only mode
 ### Key-Value Operations
 
 ```go
-// Get value by key
-value, err := db.Get(key string) (map[string]any, error)
+// Get value by key (returns any - type assert as needed)
+value, err := db.Get(key string) (any, error)
 
-// Set without expiry
-db.Set(key string, value map[string]any) error
+// Set without expiry (value can be any type)
+db.Set(key string, value any) error
 
 // Set with TTL
-db.SetEx(key string, value map[string]any, ttl time.Duration) error
+db.SetEx(key string, value any, ttl time.Duration) error
 
 // Delete key
 db.Delete(key string) error
+
+// Check if key exists and is not expired
+exists := db.Exists(key string) bool
+
+// Get remaining TTL (-1 if no expiration, -2 if key doesn't exist)
+ttl := db.TTL(key string) time.Duration
 
 // Find keys by prefix
 keys := db.FindKeysByPrefix(prefix string) []string
@@ -228,10 +256,10 @@ keys := db.FindKeysByPrefix(prefix string) []string
 
 ```go
 // Set with blob (no expiry) - returns ErrMemoryOnly in memory-only mode
-db.SetWithBlob(key string, value map[string]any, blob []byte) error
+db.SetWithBlob(key string, value any, blob []byte) error
 
 // Set with blob and TTL
-db.SetWithBlobEx(key string, value map[string]any, blob []byte, ttl time.Duration) error
+db.SetWithBlobEx(key string, value any, blob []byte, ttl time.Duration) error
 
 // Get blob
 blob, err := db.GetBlob(key string) ([]byte, error)
