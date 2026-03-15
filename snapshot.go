@@ -317,8 +317,12 @@ func (s *snapshotManager) loadV1(encoded []byte) (map[string]*entry, error) {
 			delete(doc, "_blob_ref")
 		}
 
-		// Everything else is the value
-		e.Value = doc
+		// Re-encode the value as []byte so it matches the v2 entry format
+		b, err := s.codec.Encode(doc)
+		if err != nil {
+			return nil, fmt.Errorf("failed to re-encode v1 value for key %q: %w", key, err)
+		}
+		e.Value = b
 
 		data[key] = e
 	}

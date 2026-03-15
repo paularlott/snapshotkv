@@ -28,7 +28,7 @@ type Config struct {
 
 // entry holds a stored value with its metadata
 type entry struct {
-	Value     any    `msgpack:"value" json:"value"`
+	Value     []byte `msgpack:"value" json:"value"`
 	ExpiresAt int64  `msgpack:"expires_at" json:"expires_at"` // UnixNano, 0 = no expiration
 	BlobRef   string `msgpack:"blob_ref" json:"blob_ref"`     // empty = no blob
 }
@@ -269,25 +269,28 @@ func (db *DB) Get(key string) (any, error) {
 		return nil, err
 	}
 
-	entry, exists := db.data[key]
+	e, exists := db.data[key]
 	if !exists {
 		return nil, ErrNotFound
 	}
 
-	// Check expiration
-	if entry.isExpired() {
+	if e.isExpired() {
 		return nil, ErrNotFound
 	}
 
-	return entry.Value, nil
+	var v any
+	if err := db.config.Codec.Decode(e.Value, &v); err != nil {
+		return nil, err
+	}
+	return v, nil
 }
 
-// Set stores a value without expiry.
+// Set serialises value using the DB codec and stores it without expiry.
 func (db *DB) Set(key string, value any) error {
 	return db.SetEx(key, value, 0)
 }
 
-// SetEx stores a value with TTL.
+// SetEx serialises value using the DB codec and stores it with TTL.
 // Use ttl=0 for no expiration.
 func (db *DB) SetEx(key string, value any, ttl time.Duration) error {
 	db.mu.Lock()
@@ -300,20 +303,20 @@ func (db *DB) SetEx(key string, value any, ttl time.Duration) error {
 	return db.setLocked(key, value, ttl)
 }
 
-// setLocked stores a value (must be called with lock held)
+// setLocked serialises and stores a value (must be called with lock held)
 func (db *DB) setLocked(key string, value any, ttl time.Duration) error {
-	e := &entry{Value: value}
+	encoded, err := db.config.Codec.Encode(value)
+	if err != nil {
+		return fmt.Errorf("snapshotkv: encode: %w", err)
+	}
 
-	// Set TTL if provided
+	e := &entry{Value: encoded}
 	if ttl > 0 {
 		e.ExpiresAt = time.Now().Add(ttl).UnixNano()
 	}
 
 	db.data[key] = e
-
-	// Mark dirty for debounced save
 	db.markDirty()
-
 	return nil
 }
 
@@ -397,6 +400,27 @@ func (db *DB) TTL(key string) time.Duration {
 	return time.Duration(entry.ExpiresAt - now)
 }
 
+// Count returns the number of non-expired keys matching a prefix.
+func (db *DB) Count(prefix string) int {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	if db.closed {
+		return 0
+	}
+
+	count := 0
+	for key, e := range db.data {
+		if e.isExpired() {
+			continue
+		}
+		if len(prefix) == 0 || (len(key) >= len(prefix) && key[:len(prefix)] == prefix) {
+			count++
+		}
+	}
+	return count
+}
+
 // FindKeysByPrefix returns all non-expired keys matching a prefix.
 func (db *DB) FindKeysByPrefix(prefix string) []string {
 	db.mu.RLock()
@@ -421,6 +445,34 @@ func (db *DB) FindKeysByPrefix(prefix string) []string {
 	return keys
 }
 
+// Scan iterates over all non-expired keys matching prefix, calling fn for each.
+// Stops early if fn returns false. The lock is held for the duration of the scan
+// so fn must not call any DB methods.
+func (db *DB) Scan(prefix string, fn func(key string, value any) bool) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	if db.closed {
+		return
+	}
+
+	for key, e := range db.data {
+		if e.isExpired() {
+			continue
+		}
+		if len(prefix) > 0 && (len(key) < len(prefix) || key[:len(prefix)] != prefix) {
+			continue
+		}
+		var v any
+		if err := db.config.Codec.Decode(e.Value, &v); err != nil {
+			continue
+		}
+		if !fn(key, v) {
+			return
+		}
+	}
+}
+
 // SetWithBlob stores a value with blob data (no expiry).
 // Returns ErrMemoryOnly in memory-only mode.
 func (db *DB) SetWithBlob(key string, value any, blob []byte) error {
@@ -441,6 +493,11 @@ func (db *DB) SetWithBlobEx(key string, value any, blob []byte, ttl time.Duratio
 		return err
 	}
 
+	encoded, err := db.config.Codec.Encode(value)
+	if err != nil {
+		return fmt.Errorf("snapshotkv: encode: %w", err)
+	}
+
 	// Write blob
 	blobRef, err := db.blobs.writeBlob(blob)
 	if err != nil {
@@ -452,9 +509,8 @@ func (db *DB) SetWithBlobEx(key string, value any, blob []byte, ttl time.Duratio
 		db.transactionBlobs = append(db.transactionBlobs, blobRef)
 	}
 
-	// Create entry with blob reference
 	e := &entry{
-		Value:   value,
+		Value:   encoded,
 		BlobRef: blobRef,
 	}
 	if ttl > 0 {
@@ -462,10 +518,7 @@ func (db *DB) SetWithBlobEx(key string, value any, blob []byte, ttl time.Duratio
 	}
 
 	db.data[key] = e
-
-	// Mark dirty for debounced save
 	db.markDirty()
-
 	return nil
 }
 
@@ -484,20 +537,20 @@ func (db *DB) GetBlob(key string) ([]byte, error) {
 		return nil, err
 	}
 
-	entry, exists := db.data[key]
+	e, exists := db.data[key]
 	if !exists {
 		return nil, ErrNotFound
 	}
 
-	if entry.isExpired() {
+	if e.isExpired() {
 		return nil, ErrNotFound
 	}
 
-	if entry.BlobRef == "" {
+	if e.BlobRef == "" {
 		return nil, ErrNoBlob
 	}
 
-	return db.blobs.readBlob(entry.BlobRef)
+	return db.blobs.readBlob(e.BlobRef)
 }
 
 // UpdateBlob updates the blob data for an existing key.

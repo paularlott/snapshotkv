@@ -102,7 +102,7 @@ func TestSetGet(t *testing.T) {
 	if m["name"] != "test" {
 		t.Errorf("Expected name=test, got %v", m["name"])
 	}
-	if m["value"] != 123 {
+	if fmt.Sprintf("%v", m["value"]) != "123" {
 		t.Errorf("Expected value=123, got %v", m["value"])
 	}
 }
@@ -1061,7 +1061,7 @@ func TestValuesStoredAsIs(t *testing.T) {
 	if m["_internal"] != "preserved" {
 		t.Errorf("Expected _internal=preserved, got %v", m["_internal"])
 	}
-	if m["_meta"] != 12345 {
+	if fmt.Sprintf("%v", m["_meta"]) != "12345" {
 		t.Errorf("Expected _meta=12345, got %v", m["_meta"])
 	}
 }
@@ -1146,6 +1146,332 @@ func TestMultipleSnapshots(t *testing.T) {
 
 	if count > 5 {
 		t.Errorf("Expected at most 5 snapshots, got %d", count)
+	}
+}
+
+// TestCount tests the Count method
+func TestCount(t *testing.T) {
+	dir := tempDir(t)
+	db := openDB(t, dir, nil)
+
+	for _, key := range []string{"mem:a", "mem:b", "other:x"} {
+		if err := db.Set(key, key); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+	}
+
+	if got := db.Count("mem:"); got != 2 {
+		t.Errorf("expected 2, got %d", got)
+	}
+	if got := db.Count(""); got != 3 {
+		t.Errorf("expected 3 total, got %d", got)
+	}
+	if got := db.Count("missing:"); got != 0 {
+		t.Errorf("expected 0, got %d", got)
+	}
+}
+
+// TestScan tests the Scan method
+func TestScan(t *testing.T) {
+	dir := tempDir(t)
+	db := openDB(t, dir, nil)
+
+	for _, key := range []string{"mem:a", "mem:b", "mem:c", "other:x"} {
+		if err := db.Set(key, key+"-value"); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+	}
+
+	// Scan with prefix
+	var found []string
+	db.Scan("mem:", func(key string, value any) bool {
+		found = append(found, key)
+		return true
+	})
+	if len(found) != 3 {
+		t.Errorf("expected 3 results, got %d", len(found))
+	}
+
+	// Early stop
+	count := 0
+	db.Scan("mem:", func(key string, value any) bool {
+		count++
+		return false
+	})
+	if count != 1 {
+		t.Errorf("expected early stop after 1, got %d", count)
+	}
+
+	// Empty prefix scans all
+	all := 0
+	db.Scan("", func(key string, value any) bool {
+		all++
+		return true
+	})
+	if all != 4 {
+		t.Errorf("expected 4 total, got %d", all)
+	}
+}
+
+// TestComplexStructs tests storing and retrieving nested structs
+// NOTE: msgpack uses struct field names (capitalized), not json tags,
+// so values come back with keys like "Name" not "name"
+func TestComplexStructs(t *testing.T) {
+	dir := tempDir(t)
+	db := openDB(t, dir, nil)
+
+	// Define a nested struct
+	type Address struct {
+		Street  string `json:"street"`
+		City    string `json:"city"`
+		Country string `json:"country"`
+	}
+	type Person struct {
+		Name    string  `json:"name"`
+		Age     int     `json:"age"`
+		Address Address `json:"address"`
+	}
+
+	original := Person{
+		Name: "Alice",
+		Age:  30,
+		Address: Address{
+			Street:  "123 Main St",
+			City:    "San Francisco",
+			Country: "USA",
+		},
+	}
+
+	key := "person:alice"
+	if err := db.Set(key, original); err != nil {
+		t.Fatalf("Failed to set: %v", err)
+	}
+
+	got, err := db.Get(key)
+	if err != nil {
+		t.Fatalf("Failed to get: %v", err)
+	}
+
+	// After msgpack round-trip, structs become map[string]any
+	// Keys are struct field names (capitalized), not json tags
+	m, ok := got.(map[string]any)
+	if !ok {
+		t.Fatalf("Expected map[string]any, got %T", got)
+	}
+
+	if m["Name"] != "Alice" {
+		t.Errorf("Expected Name=Alice, got %v", m["Name"])
+	}
+	if fmt.Sprintf("%v", m["Age"]) != "30" {
+		t.Errorf("Expected Age=30, got %v", m["Age"])
+	}
+
+	// Nested struct also becomes map[string]any
+	addr, ok := m["Address"].(map[string]any)
+	if !ok {
+		t.Fatalf("Expected Address to be map[string]any, got %T", m["Address"])
+	}
+	if addr["City"] != "San Francisco" {
+		t.Errorf("Expected City=San Francisco, got %v", addr["City"])
+	}
+}
+
+// TestSliceOfStructs tests storing and retrieving slices of structs
+func TestSliceOfStructs(t *testing.T) {
+	dir := tempDir(t)
+	db := openDB(t, dir, nil)
+
+	type Item struct {
+		ID    int    `json:"id"`
+		Name  string `json:"name"`
+		Price int    `json:"price"`
+	}
+
+	items := []Item{
+		{ID: 1, Name: "Apple", Price: 100},
+		{ID: 2, Name: "Banana", Price: 200},
+		{ID: 3, Name: "Cherry", Price: 300},
+	}
+
+	key := "items:fruit"
+	if err := db.Set(key, items); err != nil {
+		t.Fatalf("Failed to set: %v", err)
+	}
+
+	got, err := db.Get(key)
+	if err != nil {
+		t.Fatalf("Failed to get: %v", err)
+	}
+
+	// Slice becomes []any, each element is map[string]any
+	slice, ok := got.([]any)
+	if !ok {
+		t.Fatalf("Expected []any, got %T", got)
+	}
+
+	if len(slice) != 3 {
+		t.Fatalf("Expected 3 items, got %d", len(slice))
+	}
+
+	// Check first item (keys are struct field names, not json tags)
+	first, ok := slice[0].(map[string]any)
+	if !ok {
+		t.Fatalf("Expected first item to be map[string]any, got %T", slice[0])
+	}
+	if first["Name"] != "Apple" {
+		t.Errorf("Expected Name=Apple, got %v", first["Name"])
+	}
+}
+
+// TestComplexStructsWithScan tests Scan with complex struct values
+func TestComplexStructsWithScan(t *testing.T) {
+	dir := tempDir(t)
+	db := openDB(t, dir, nil)
+
+	type Config struct {
+		Name   string `json:"name"`
+		Value  int    `json:"value"`
+		Active bool   `json:"active"`
+	}
+
+	configs := map[string]Config{
+		"config:a": {Name: "alpha", Value: 1, Active: true},
+		"config:b": {Name: "beta", Value: 2, Active: false},
+		"config:c": {Name: "gamma", Value: 3, Active: true},
+	}
+
+	for k, v := range configs {
+		if err := db.Set(k, v); err != nil {
+			t.Fatalf("Failed to set %s: %v", k, err)
+		}
+	}
+
+	// Scan and verify (keys are struct field names)
+	count := 0
+	db.Scan("config:", func(key string, value any) bool {
+		count++
+		m, ok := value.(map[string]any)
+		if !ok {
+			t.Errorf("Key %s: expected map[string]any, got %T", key, value)
+			return true
+		}
+		if m["Name"] == nil {
+			t.Errorf("Key %s: missing Name field", key)
+		}
+		return true
+	})
+
+	if count != 3 {
+		t.Errorf("Expected 3 items from scan, got %d", count)
+	}
+}
+
+// TestDeeplyNestedStruct tests deeply nested structures
+func TestDeeplyNestedStruct(t *testing.T) {
+	dir := tempDir(t)
+	db := openDB(t, dir, nil)
+
+	type Inner struct {
+		Value string `json:"value"`
+	}
+	type Middle struct {
+		Inner Inner `json:"inner"`
+	}
+	type Outer struct {
+		Middle Middle `json:"middle"`
+	}
+
+	original := Outer{
+		Middle: Middle{
+			Inner: Inner{
+				Value: "deep",
+			},
+		},
+	}
+
+	key := "nested:deep"
+	if err := db.Set(key, original); err != nil {
+		t.Fatalf("Failed to set: %v", err)
+	}
+
+	got, err := db.Get(key)
+	if err != nil {
+		t.Fatalf("Failed to get: %v", err)
+	}
+
+	// Navigate through nested maps (keys are struct field names)
+	outer, ok := got.(map[string]any)
+	if !ok {
+		t.Fatalf("Expected map[string]any, got %T", got)
+	}
+
+	middle, ok := outer["Middle"].(map[string]any)
+	if !ok {
+		t.Fatalf("Expected Middle to be map[string]any, got %T", outer["Middle"])
+	}
+
+	inner, ok := middle["Inner"].(map[string]any)
+	if !ok {
+		t.Fatalf("Expected Inner to be map[string]any, got %T", middle["Inner"])
+	}
+
+	if inner["Value"] != "deep" {
+		t.Errorf("Expected Value=deep, got %v", inner["Value"])
+	}
+}
+
+// TestComplexStructPersistence tests that complex structs persist across db restart
+func TestComplexStructPersistence(t *testing.T) {
+	dir := tempDir(t)
+
+	type User struct {
+		Name  string   `json:"name"`
+		Roles []string `json:"roles"`
+	}
+
+	// Open, write, close
+	db, err := Open(dir, &Config{SaveDebounce: 0})
+	if err != nil {
+		t.Fatalf("Failed to open: %v", err)
+	}
+
+	user := User{
+		Name:  "Bob",
+		Roles: []string{"admin", "user"},
+	}
+	if err := db.Set("user:bob", user); err != nil {
+		t.Fatalf("Failed to set: %v", err)
+	}
+	db.Close()
+
+	// Reopen and verify
+	db2, err := Open(dir, &Config{SaveDebounce: 0})
+	if err != nil {
+		t.Fatalf("Failed to reopen: %v", err)
+	}
+	defer db2.Close()
+
+	got, err := db2.Get("user:bob")
+	if err != nil {
+		t.Fatalf("Failed to get after reopen: %v", err)
+	}
+
+	// Keys are struct field names, not json tags
+	m, ok := got.(map[string]any)
+	if !ok {
+		t.Fatalf("Expected map[string]any, got %T", got)
+	}
+
+	if m["Name"] != "Bob" {
+		t.Errorf("Expected Name=Bob, got %v", m["Name"])
+	}
+
+	roles, ok := m["Roles"].([]any)
+	if !ok {
+		t.Fatalf("Expected Roles to be []any, got %T", m["Roles"])
+	}
+	if len(roles) != 2 {
+		t.Errorf("Expected 2 roles, got %d", len(roles))
 	}
 }
 

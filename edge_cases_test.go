@@ -228,9 +228,9 @@ func TestCleanupExpiredWithDifferentTypes(t *testing.T) {
 	expiredTime := time.Now().Add(-time.Hour).UnixNano() // 1 hour ago in UnixNano
 
 	db.mu.Lock()
-	db.data["test:expired1"] = &entry{Value: "data1", ExpiresAt: expiredTime}
-	db.data["test:expired2"] = &entry{Value: "data2", ExpiresAt: expiredTime}
-	db.data["test:valid"] = &entry{Value: "data3"} // No expiration
+	db.data["test:expired1"] = &entry{Value: []byte(`"data1"`), ExpiresAt: expiredTime}
+	db.data["test:expired2"] = &entry{Value: []byte(`"data2"`), ExpiresAt: expiredTime}
+	db.data["test:valid"] = &entry{Value: []byte(`"data3"`)} // No expiration
 	db.mu.Unlock()
 
 	// Run cleanup
